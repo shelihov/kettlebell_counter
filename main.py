@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
 import time
+from ultralytics import YOLO
 
 class KettlebellCounter:
     def __init__(self):
@@ -9,122 +10,60 @@ class KettlebellCounter:
         self.prev_y = None
         self.moving_up = False
         self.rep_started = False
-        self.rep_zone_entered = False
-        self.direction_buffer = []  # Буфер для сглаживания определения направления
-        self.buffer_size = 3  # Размер буфера
-        self.lockout_confirmed = False  # Флаг фиксации в верхней точке
-        # Инициализируем вычитатель фона
-        self.bg_subtractor = cv2.createBackgroundSubtractorMOG2(
-            history=500,        # Количество кадров для истории
-            varThreshold=16,    # Порог определения переднего плана
-            detectShadows=False # Отключаем определение теней
-        )
-        # Параметры для определения цвета кожи в HSV
-        self.lower_skin = np.array([0, 30, 60], dtype=np.uint8)
-        self.upper_skin = np.array([25, 150, 255], dtype=np.uint8)
-        # Добавляем отслеживание предыдущей позиции
-        self.last_valid_point = None
-        self.lost_tracking_frames = 0
-        self.max_lost_frames = 10
+        self.lockout_confirmed = False
+        self.direction_buffer = []
+        self.buffer_size = 3
+        
+        # Загружаем модель YOLOv8 для определения позы
+        self.model = YOLO('yolov8n-pose.pt')
 
-    def detect_movement(self, frame):
-        # Конвертируем в HSV для определения кожи
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    def detect_pose(self, frame):
+        # Получаем результаты определения позы
+        results = self.model(frame, stream=True)
         
-        # Создаем маску для кожи
-        skin_mask = cv2.inRange(hsv, self.lower_skin, self.upper_skin)
-        
-        # Применяем вычитание фона
-        fg_mask = self.bg_subtractor.apply(frame)
-        
-        # Комбинируем маски движения и кожи
-        combined_mask = cv2.bitwise_and(fg_mask, skin_mask)
-        
-        # Морфологические операции для уменьшения шума
-        kernel = np.ones((5,5), np.uint8)
-        combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_OPEN, kernel)
-        combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_CLOSE, kernel)
-        combined_mask = cv2.dilate(combined_mask, kernel, iterations=2)
-        
-        # Находим контуры
-        contours, _ = cv2.findContours(combined_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        if not contours:
-            self.lost_tracking_frames += 1
-            if self.lost_tracking_frames > self.max_lost_frames:
-                self.last_valid_point = None
-            return None, combined_mask
-            
-        # Находим подходящий контур
-        valid_contours = []
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if 500 < area < 5000:  # Ограничиваем размер области
-                # Получаем ограничивающий прямоугольник
-                x, y, w, h = cv2.boundingRect(cnt)
-                aspect_ratio = float(w)/h
-                # Проверяем соотношение сторон (для руки оно обычно меньше 1)
-                if aspect_ratio < 1.0:
-                    valid_contours.append(cnt)
-        
-        if not valid_contours:
-            self.lost_tracking_frames += 1
-            if self.lost_tracking_frames > self.max_lost_frames:
-                self.last_valid_point = None
-            return None, combined_mask
-        
-        # Выбираем контур ближайший к последней валидной точке
-        if self.last_valid_point is not None:
-            # Находим контур ближайший к последней точке
-            closest_contour = min(valid_contours, 
-                key=lambda cnt: abs(cnt[:, :, 0].mean() - self.last_valid_point[0]) + 
-                              abs(cnt[:, :, 1].mean() - self.last_valid_point[1]))
-        else:
-            # Если нет последней точки, берем самый большой подходящий контур
-            closest_contour = max(valid_contours, key=cv2.contourArea)
-        
-        # Находим верхнюю точку контура
-        top_point = tuple(closest_contour[closest_contour[:, :, 1].argmin()][0])
-        
-        # Проверяем, не слишком ли резко изменилась позиция
-        if self.last_valid_point is not None:
-            dx = abs(top_point[0] - self.last_valid_point[0])
-            dy = abs(top_point[1] - self.last_valid_point[1])
-            if dx > 100 or dy > 100:  # Максимальное допустимое смещение
-                self.lost_tracking_frames += 1
-                if self.lost_tracking_frames > self.max_lost_frames:
-                    self.last_valid_point = None
-                return None, combined_mask
-        
-        # Обновляем последнюю валидную точку
-        self.last_valid_point = top_point
-        self.lost_tracking_frames = 0
-        
-        # Рисуем контур на кадре
-        cv2.drawContours(frame, [closest_contour], -1, (0, 255, 0), 2)
-        
-        return top_point, combined_mask
+        for result in results:
+            keypoints = result.keypoints.data
+            if len(keypoints) > 0 and keypoints.shape[1] > 10:
+                # Получаем координаты правого запястья (индекс 10)
+                right_wrist = keypoints[0][10]
+                
+                # Проверяем уверенность определения
+                if right_wrist[2].item() < 0.3:  # Если уверенность низкая
+                    continue
+                
+                # Преобразуем координаты в целые числа
+                wrist_point = (
+                    int(right_wrist[0].item()),
+                    int(right_wrist[1].item())
+                )
+                
+                # Проверяем, что точка в разумных пределах кадра
+                height, width = frame.shape[:2]
+                if not (0 <= wrist_point[0] <= width and 0 <= wrist_point[1] <= height):
+                    continue
+                
+                return wrist_point, frame
+                
+        return None, frame
 
     def count_reps(self):
-        # Инициализация камеры
         cap = cv2.VideoCapture(0)
         if not cap.isOpened():
             print("Не удалось открыть камеру!")
             return
 
-        # Устанавливаем горизонтальное разрешение
+        # Настройка окна и камеры
         width = 640
         height = 360
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-
-        # Создаем окно
+        
         cv2.namedWindow('Kettlebell Counter', cv2.WINDOW_NORMAL)
-        cv2.resizeWindow('Kettlebell Counter', 360, 640)  # Вертикальное окно
+        cv2.resizeWindow('Kettlebell Counter', 360, 640)
 
-        # Зона подсчета для рывка
-        lockout_zone = height * 0.2  # Зона фиксации вверху
-        start_zone = height * 0.7    # Стартовая зона внизу
+        # Зоны для рывка
+        lockout_zone = height * 0.2
+        start_zone = height * 0.7
         min_rep_interval = 0.5
 
         while True:
@@ -132,12 +71,21 @@ class KettlebellCounter:
             if not ret:
                 break
 
-            movement_point, thresh = self.detect_movement(frame)
+            movement_point, processed_frame = self.detect_pose(frame)
 
             if movement_point is not None:
                 x, y = movement_point
                 
-                cv2.circle(frame, movement_point, 10, (0, 0, 255), -1)
+                # Определяем зону левого верхнего угла (10% от размеров кадра)
+                corner_zone_x = width * 0.1
+                corner_zone_y = height * 0.1
+                
+                # Проверяем, не находится ли точка в левом верхнем углу
+                in_corner = x < corner_zone_x and y < corner_zone_y
+                
+                # Рисуем более заметную точку запястья
+                cv2.circle(processed_frame, movement_point, 15, (0, 0, 255), -1)
+                cv2.circle(processed_frame, movement_point, 20, (0, 0, 255), 2)
                 
                 if self.prev_y is not None:
                     # Определяем текущее направление
@@ -151,16 +99,14 @@ class KettlebellCounter:
                 
                 current_time = time.time()
                 
-                # Начинаем новое повторение в стартовой позиции
-                if y > start_zone and not any(self.direction_buffer[-2:]):
+                # Начинаем новое повторение
+                if y > start_zone and not any(self.direction_buffer[-2:]) and not in_corner:
                     self.rep_started = True
-                    self.rep_zone_entered = False
                     self.lockout_confirmed = False
                 
-                # Проверяем фиксацию в верхней точке
+                # Проверяем фиксацию
                 if (self.rep_started and y < lockout_zone and not self.moving_up and 
-                    not self.lockout_confirmed):
-                    # Ждем небольшую паузу для подтверждения фиксации
+                    not self.lockout_confirmed and not in_corner):
                     if current_time - self.last_count_time > min_rep_interval:
                         self.counter += 1
                         self.last_count_time = current_time
@@ -169,23 +115,22 @@ class KettlebellCounter:
                 self.prev_y = y
 
             # Рисуем зоны
-            # Зона фиксации (синяя)
-            cv2.line(frame, (0, int(lockout_zone)), (frame.shape[1], int(lockout_zone)), 
+            cv2.line(processed_frame, (0, int(lockout_zone)), 
+                    (processed_frame.shape[1], int(lockout_zone)), 
                     (255, 0, 0), 2)
-            # Стартовая зона (темно-желтая)
-            cv2.line(frame, (0, int(start_zone)), (frame.shape[1], int(start_zone)), 
+            cv2.line(processed_frame, (0, int(start_zone)), 
+                    (processed_frame.shape[1], int(start_zone)), 
                     (0, 140, 140), 2)
 
-            # Отображаем счетчик и состояние
-            cv2.putText(frame, f'Reps: {self.counter}', (10, 50),
+            # Отображаем информацию
+            cv2.putText(processed_frame, f'Reps: {self.counter}', (10, 50),
                        cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 3)
             
             state = "LOCKOUT" if self.lockout_confirmed else "UP" if self.moving_up else "DOWN"
-            cv2.putText(frame, f'State: {state}', (10, 100),
+            cv2.putText(processed_frame, f'State: {state}', (10, 100),
                        cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 0, 0), 3)
 
-            # Показываем кадр
-            cv2.imshow('Kettlebell Counter', frame)
+            cv2.imshow('Kettlebell Counter', processed_frame)
             
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
